@@ -3,14 +3,20 @@ import torch.optim as optim
 import scipy.io as sio
 import os
 import glob
+from gymnasium.vector import SyncVectorEnv
 from cartpole_gym import CustomCartPoleEnv
-from model.amp import Discriminator, Policy, collect_trajectory
+from model.amp import Discriminator, Policy, collect_trajectory_vectorized
 
+
+# --- Device 설정 ---
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"Using device: {device}")
 
 # --- Hyperparameters ---
 EXPERT_DATA_FOLDER = 'expert_data'  # 폴더 경로로 변경
-NUM_EPISODES = 1000                   # 학습 몇번 할건지
-MAX_STEPS = 5000                   # 리플레이 버퍼 크기
+NUM_EPISODES = 500                   # 학습 몇번 할건지
+MAX_STEPS = 1000                   # 환경당 스텝 수
+NUM_ENVS = 10                      # 병렬 환경 개수
 BATCH_SIZE = 256
 DISC_LR = 1e-3
 POLICY_LR = 1e-4
@@ -57,14 +63,19 @@ def load_expert_data(folder_path):
 
 # --- Training Loop ---
 def train():
-    # Expert data 로드
+    # Expert data 로드 및 GPU로 이동
     expert_s, expert_s_next = load_expert_data(EXPERT_DATA_FOLDER)
+    expert_s = expert_s.to(device)
+    expert_s_next = expert_s_next.to(device)
     print(f"\nTotal expert data: {expert_s.shape[0]} (s, s') pairs\n")
 
-    # 환경 및 모델 초기화
-    env = CustomCartPoleEnv(max_episode_steps=MAX_STEPS)
-    disc = Discriminator(STATE_DIM)
-    policy = Policy(STATE_DIM, ACTION_DIM)
+    # 벡터 환경 초기화 (10개 환경 병렬 실행)
+    envs = SyncVectorEnv([
+        lambda: CustomCartPoleEnv(max_episode_steps=MAX_STEPS)
+        for _ in range(NUM_ENVS)
+    ])
+    disc = Discriminator(STATE_DIM).to(device)
+    policy = Policy(STATE_DIM, ACTION_DIM).to(device)
 
     disc_opt = optim.Adam(disc.parameters(), lr=DISC_LR)
     policy_opt = optim.Adam(policy.parameters(), lr=POLICY_LR)
@@ -81,15 +92,20 @@ def train():
         # 이하 반복.
 
 
-        # 1. Agent 궤적 수집해서 replay buffer에 저장
-        agent_s, agent_a, agent_s_next, task_rewards = collect_trajectory(env, policy, MAX_STEPS)
+        # 1. Agent 궤적 수집해서 replay buffer에 저장 (GPU로 이동)
+        # 10개 환경에서 각 1000 step = 총 10000 step 수집
+        agent_s, agent_a, agent_s_next, task_rewards = collect_trajectory_vectorized(envs, policy, MAX_STEPS, device)
+        agent_s = agent_s.to(device)
+        agent_a = agent_a.to(device)
+        agent_s_next = agent_s_next.to(device)
+        task_rewards = task_rewards.to(device)
     
 
 
         # 2. Discriminator 학습
         # Expert → D 출력 1, Agent → D 출력 0
-        expert_idx = torch.randint(0, expert_s.shape[0], (BATCH_SIZE,))
-        agent_idx = torch.randint(0, agent_s.shape[0], (BATCH_SIZE,))
+        expert_idx = torch.randint(0, expert_s.shape[0], (BATCH_SIZE,), device=device)
+        agent_idx = torch.randint(0, agent_s.shape[0], (BATCH_SIZE,), device=device)
 
         expert_out = disc(expert_s[expert_idx], expert_s_next[expert_idx])
         agent_out = disc(agent_s[agent_idx], agent_s_next[agent_idx])
@@ -116,23 +132,19 @@ def train():
             # AMP 총 보상 = 가중 평균
             rewards = STYLE_REWARD_WEIGHT * style_rewards + TASK_REWARD_WEIGHT * task_rewards
 
-        # Discounted returns 계산
+        # Discounted returns 계산 (GPU에서 처리, .item() 제거로 동기화 방지)
         returns = torch.zeros_like(rewards)
-        running_return = 0.0
+        running_return = torch.tensor(0.0, device=device)
         for t in reversed(range(len(rewards))):
-            running_return = rewards[t].item() + GAMMA * running_return
+            running_return = rewards[t] + GAMMA * running_return
             returns[t] = running_return
 
         # Baseline (advantage function)
         returns = returns - returns.mean()
 
-        # log π(a|s) 수집 (continuous action)
-        log_probs = []
-        for t in range(len(agent_s)):
-            dist = policy(agent_s[t].unsqueeze(0))
-            # policy 분포에서 a가 선택됐을 확률(expected return을 구하기 위해)
-            log_probs.append(dist.log_prob(agent_a[t]).sum(-1))
-        log_probs = torch.stack(log_probs).squeeze()
+        # log π(a|s) 배치 계산 (for 루프 제거 → 대폭 속도 향상)
+        dist = policy(agent_s)  # 전체 배치 한번에 처리
+        log_probs = dist.log_prob(agent_a).sum(-1)
 
         policy_loss = -torch.mean(log_probs * returns)
 
@@ -150,7 +162,7 @@ def train():
                   f"Task R: {task_rewards.mean().item():+.4f} | "
                   f"Total R: {rewards.mean().item():+.4f}")
 
-    env.close()
+    envs.close()
 
     # 학습된 모델 저장
     torch.save(policy.state_dict(), 'policy.pth')
